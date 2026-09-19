@@ -1,0 +1,21 @@
+dependencies:
+  idf:
+    source:
+      type: idf
+    version: 6.1.0
+  jef-sure/dgx:
+    component_hash: 554e7e8b129b8928b6f727713bb852c19e4b4dccb0a27615fa046d36b4519418
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.0.12
+direct_dependencies:
+- idf
+- jef-sure/dgx
+manifest_hash: 82882d3b503c18621af7f81eae6d4f3a109542d42caab003c9b6e7acf7f0b92b
+target: esp32
+version: 3.0.0

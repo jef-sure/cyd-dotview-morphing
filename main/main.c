@@ -34,7 +34,7 @@ enum
     CYD_TFT_SPI_HZ    = 40 * 1000 * 1000
 };
 
-static const char *TAG      = "cyd-life-morphing";
+static const char *TAG      = "cyd-dotview-morphing";
 static int         neiby[8] = {-1, 0, 0, 1, -1, -1, 1, 1};
 static int         neibx[8] = {0, -1, 1, 0, -1, 1, 1, -1};
 
@@ -76,51 +76,37 @@ typedef struct
 
 typedef struct
 {
-    int      hash_count;
+    int      count;
+    int      capacity;
     Segment *segments;
-} SegmentsInCell;
+} SegmentVector;
 
 typedef struct
 {
-    int16_t        x;
-    int16_t        y;
-    bool           occupied;
-    SegmentsInCell cell;
-} SegmentHashSlot;
-
-typedef struct
-{
-    SegmentHashSlot *slots;
-    int              hash_capacity;
-    int              hash_count;
-    int              radius;
-    int              cell_width;
-    int              grid_width;
-    int              grid_height;
-    int              rlut_limit;
-    int             *rlut;
-    int             *xcell_offset;
-    dgx_screen_t    *vscreen;
-    uint8_t         *glow_next;
-    uint8_t         *glow_prev;
-    Point           *static_points;
-    int              static_points_count;
-    Point           *fading_points;
-    int              fading_points_count;
-    uint32_t         cp_from;
-    uint32_t         cp_to;
-    int              font_y_bottom_max;
-    int              font_x_lowest;
+    SegmentVector segment_vector;
+    int           hash_capacity;
+    int           hash_count;
+    int           radius;
+    int           cell_width;
+    int           grid_width;
+    int           grid_height;
+    int           rlut_limit;
+    int          *rlut;
+    int          *xcell_offset;
+    dgx_screen_t *vscreen;
+    uint8_t      *glow_next;
+    uint8_t      *glow_prev;
+    Point        *static_points;
+    int           static_points_count;
+    Point        *fading_points;
+    int           fading_points_count;
+    uint32_t      cp_from;
+    uint32_t      cp_to;
+    CellMatrix   *cell_matrix_from;
+    CellMatrix   *cell_matrix_to;
+    int           font_y_bottom_max;
+    int           font_x_lowest;
 } MorphingRender;
-
-static uint32_t hash_xy(int x, int y)
-{
-    uint32_t h = (uint32_t)(int32_t)x * 73856093u ^ (uint32_t)(int32_t)y * 19349663u;
-    h ^= h >> 16;
-    h *= 0x7feb352du;
-    h ^= h >> 15;
-    return h;
-}
 
 static int hash_next_pow2(int hash_capacity)
 {
@@ -136,151 +122,65 @@ static int hash_next_pow2(int hash_capacity)
     return hash_capacity + 1;
 }
 
-static bool hash_init(MorphingRender *hash, int hash_capacity)
+static bool segment_vector_init(MorphingRender *renderer, int capacity)
 {
-    if (hash == NULL) {
+    if (renderer == NULL) {
         return false;
     }
-    hash_capacity = hash_next_pow2(hash_capacity);
-    hash->slots   = (SegmentHashSlot *)calloc((size_t)hash_capacity, sizeof(SegmentHashSlot));
-    if (hash->slots == NULL) {
+    capacity                          = hash_next_pow2(capacity);
+    renderer->segment_vector.segments = (Segment *)calloc((size_t)capacity, sizeof(Segment));
+    if (renderer->segment_vector.segments == NULL) {
         return false;
     }
-    hash->hash_count    = 0;
-    hash->hash_capacity = hash_capacity;
+    renderer->segment_vector.count    = 0;
+    renderer->segment_vector.capacity = capacity;
     return true;
 }
 
-static bool hash_rehash(MorphingRender *hash, int new_capacity)
+static bool segment_vector_realloc(MorphingRender *renderer, int new_capacity)
 {
-    SegmentHashSlot *old_slots    = hash->slots;
-    int              old_capacity = hash->hash_capacity;
-    SegmentHashSlot *new_slots    = (SegmentHashSlot *)calloc((size_t)new_capacity, sizeof(SegmentHashSlot));
-    if (new_slots == NULL) {
+    Segment *new_segments = (Segment *)realloc(renderer->segment_vector.segments, (size_t)new_capacity * sizeof(Segment));
+    if (new_segments == NULL) {
         return false;
     }
-
-    hash->slots         = new_slots;
-    hash->hash_capacity = new_capacity;
-    hash->hash_count    = 0;
-
-    for (int i = 0; i < old_capacity; i++) {
-        if (!old_slots[i].occupied) {
-            continue;
-        }
-        uint32_t mask  = (uint32_t)new_capacity - 1u;
-        uint32_t index = hash_xy(old_slots[i].x, old_slots[i].y) & mask;
-        while (new_slots[index].occupied) {
-            index = (index + 1u) & mask;
-        }
-        new_slots[index] = old_slots[i];
-        hash->hash_count++;
-    }
-
-    free(old_slots);
+    renderer->segment_vector.segments = new_segments;
+    renderer->segment_vector.capacity = new_capacity;
     return true;
 }
 
-static SegmentHashSlot *hash_find_slot(const MorphingRender *hash, int x, int y, bool for_insert)
+bool segment_vector_add(MorphingRender *renderer, Segment segment)
 {
-    if (hash == NULL || hash->slots == NULL || hash->hash_capacity == 0) {
-        return NULL;
+    if (renderer == NULL) {
+        return false;
     }
-
-    uint32_t         mask        = (uint32_t)hash->hash_capacity - 1u;
-    uint32_t         index       = hash_xy(x, y) & mask;
-    SegmentHashSlot *first_empty = NULL;
-
-    for (int probed = 0; probed < hash->hash_capacity; probed++) {
-        SegmentHashSlot *slot = &hash->slots[index];
-        if (!slot->occupied) {
-            if (first_empty == NULL) {
-                first_empty = slot;
-            }
-            break;
-        }
-        if (slot->x == (int16_t)x && slot->y == (int16_t)y) {
-            return slot;
-        }
-        index = (index + 1u) & mask;
-    }
-
-    return for_insert ? first_empty : NULL;
-}
-
-void hash_add(MorphingRender *hash, int x, int y, Segment segment)
-{
-    if (hash == NULL) {
-        return;
-    }
-    if (hash->slots == NULL && !hash_init(hash, 16)) {
-        return;
-    }
-    if (hash->hash_count * 4 >= hash->hash_capacity * 3) {
-        if (!hash_rehash(hash, hash->hash_capacity * 2)) {
-            return;
+    if (renderer->segment_vector.count >= renderer->segment_vector.capacity) {
+        if (!segment_vector_realloc(renderer, renderer->segment_vector.capacity * 2)) {
+            return false;
         }
     }
-
-    SegmentHashSlot *slot = hash_find_slot(hash, x, y, true);
-    if (slot == NULL) {
-        return;
-    }
-
-    if (!slot->occupied) {
-        slot->occupied        = true;
-        slot->x               = (int16_t)x;
-        slot->y               = (int16_t)y;
-        slot->cell.hash_count = 0;
-        slot->cell.segments   = NULL;
-        hash->hash_count++;
-    }
-
-    Segment *grown = (Segment *)realloc(slot->cell.segments, (size_t)(slot->cell.hash_count + 1) * sizeof(Segment));
-    if (grown == NULL) {
-        return;
-    }
-    slot->cell.segments                        = grown;
-    slot->cell.segments[slot->cell.hash_count] = segment;
-    slot->cell.hash_count++;
+    renderer->segment_vector.segments[renderer->segment_vector.count] = segment;
+    renderer->segment_vector.count++;
+    return true;
 }
 
-void hash_clear(MorphingRender *hash)
+void segment_vector_clear(MorphingRender *renderer)
 {
-    if (hash == NULL || hash->slots == NULL) {
+    if (renderer == NULL || renderer->segment_vector.segments == NULL) {
         return;
     }
-    for (int i = 0; i < hash->hash_capacity; i++) {
-        if (hash->slots[i].occupied) {
-            free(hash->slots[i].cell.segments);
-        }
-        hash->slots[i].occupied        = false;
-        hash->slots[i].cell.hash_count = 0;
-        hash->slots[i].cell.segments   = NULL;
-    }
-    hash->hash_count = 0;
+    renderer->segment_vector.count = 0;
 }
 
-SegmentsInCell hash_get(const MorphingRender *hash, int x, int y)
+void segment_vector_free(MorphingRender *renderer)
 {
-    SegmentsInCell   empty = {.hash_count = 0, .segments = NULL};
-    SegmentHashSlot *slot  = hash_find_slot(hash, x, y, false);
-    if (slot == NULL) {
-        return empty;
-    }
-    return slot->cell;
-}
-
-void hash_free(MorphingRender *hash)
-{
-    hash_clear(hash);
-    if (hash == NULL) {
+    segment_vector_clear(renderer);
+    if (renderer == NULL) {
         return;
     }
-    free(hash->slots);
-    hash->slots         = NULL;
-    hash->hash_capacity = 0;
-    hash->hash_count    = 0;
+    free(renderer->segment_vector.segments);
+    renderer->segment_vector.segments = NULL;
+    renderer->segment_vector.capacity = 0;
+    renderer->segment_vector.count    = 0;
 }
 
 #define CELL_OFFSET(x, y, width) ((y) * (width) + (x))
@@ -366,7 +266,7 @@ static void morphing_render_free(MorphingRender *render)
     free(render->glow_prev);
     free(render->static_points);
     free(render->fading_points);
-    hash_free(render);
+    segment_vector_free(render);
 }
 
 static void morphing_render_clear_transition(MorphingRender *render)
@@ -374,7 +274,7 @@ static void morphing_render_clear_transition(MorphingRender *render)
     if (render == NULL) {
         return;
     }
-    hash_clear(render);
+    segment_vector_clear(render);
     free(render->static_points);
     free(render->fading_points);
     render->static_points       = NULL;
@@ -393,7 +293,7 @@ static bool morphing_render_init(MorphingRender *render, int width, int height, 
     memset(render, 0, sizeof(*render));
     render->font_y_bottom_max = font_y_bottom_max;
     render->font_x_lowest     = font_x_lowest;
-    if (!hash_init(render, 16)) {
+    if (!segment_vector_init(render, 16)) {
         return false;
     }
 
@@ -471,13 +371,15 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
                         .start_intensity = 0,
                         .end_intensity   = 255
                     };
-                    hash_add(render, x, y, s);
+                    segment_vector_add(render, s);
                 }
             }
         }
         render->static_points_count = 0;
-        free(from);
-        free(to);
+        free(render->cell_matrix_from);
+        free(render->cell_matrix_to);
+        render->cell_matrix_from = from;
+        render->cell_matrix_to   = to;
         return true;
     }
     if (!to || to->number_of_set_cells == 0) {
@@ -490,13 +392,15 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
                         .start_intensity = 255,
                         .end_intensity   = 0
                     };
-                    hash_add(render, x, y, s);
+                    segment_vector_add(render, s);
                 }
             }
         }
         render->static_points_count = 0;
-        free(from);
-        free(to);
+        free(render->cell_matrix_from);
+        free(render->cell_matrix_to);
+        render->cell_matrix_from = from;
+        render->cell_matrix_to   = to;
         return true;
     }
     uint8_t *source_used = (uint8_t *)calloc((size_t)(width * height + 7) / 8, sizeof(uint8_t));
@@ -560,7 +464,7 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
                             .start_intensity = 255,
                             .end_intensity   = 255
                         };
-                        hash_add(render, x, y, s);
+                        segment_vector_add(render, s);
                         mark_cell_set(source_used, nx, ny, width, true);
                         found_source = true;
                         break;
@@ -600,7 +504,7 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
                                         .start_intensity = 255,
                                         .end_intensity   = 255
                                     };
-                                    hash_add(render, x, y, s);
+                                    segment_vector_add(render, s);
                                     mark_cell_set(source_used, nx, ny, from->width, true);
                                     found_source = true;
                                     break;
@@ -616,7 +520,7 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
                         .start_intensity = 0,
                         .end_intensity   = 255
                     };
-                    hash_add(render, x, y, s);
+                    segment_vector_add(render, s);
                 }
             }
         }
@@ -633,8 +537,10 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
     render->fading_points_count = fading_points_count;
     free(dest_second_phase);
     free(source_used);
-    free(from);
-    free(to);
+    free(render->cell_matrix_from);
+    free(render->cell_matrix_to);
+    render->cell_matrix_from = from;
+    render->cell_matrix_to   = to;
     return true;
 }
 
@@ -711,13 +617,21 @@ static void collect_glow(MorphingRender *transformation, uint8_t *glow, Point po
 
 void collect_initial_glow(MorphingRender *transformation)
 {
-    for (int i = 0; i < transformation->static_points_count; i++) {
-        collect_glow(                         //
-            transformation,                   //
-            transformation->glow_next,        //
-            transformation->static_points[i], //
-            255                               //
-        );
+    if (!transformation || !transformation->cell_matrix_from) {
+        return;
+    }
+    int cell_width = transformation->cell_width;
+    for (int y = 0; y < transformation->cell_matrix_from->height; y++) {
+        for (int x = 0; x < transformation->cell_matrix_from->width; x++) {
+            if (is_cell_set(transformation->cell_matrix_from->cells, x, y, transformation->cell_matrix_from->width)) {
+                collect_glow(                                                                                //
+                    transformation,                                                                          //
+                    transformation->glow_next,                                                               //
+                    (Point){.x = x * cell_width + (cell_width / 2), .y = y * cell_width + (cell_width / 2)}, //
+                    255                                                                                      //
+                );
+            }
+        }
     }
 }
 
@@ -733,21 +647,15 @@ void render_morphing(float t, MorphingRender *transformation)
     memset(transformation->glow_next, 0, (size_t)transformation->grid_width * transformation->grid_height);
 
     float t_tail = max_float(t * 1.5f - 0.5f, 0.0f);
-    for (int i = 0; i < transformation->hash_capacity; i++) {
-        SegmentHashSlot *slot = &transformation->slots[i];
-        if (!slot->occupied) {
-            continue;
-        }
-        for (int j = 0; j < slot->cell.hash_count; j++) {
-            Segment *segment   = &slot->cell.segments[j];
-            Point    tail      = inner_point(t_tail, segment->start, segment->end);
-            Point    head      = inner_point(t, segment->start, segment->end);
-            uint8_t  intensity = segment->start_intensity == segment->end_intensity
-                                   ? segment->end_intensity
-                                   : segment->start_intensity + ((segment->end_intensity - segment->start_intensity) * t);
-            collect_glow(transformation, transformation->glow_next, tail, intensity / 2);
-            collect_glow(transformation, transformation->glow_next, head, intensity / 2);
-        }
+    for (int i = 0; i < transformation->segment_vector.count; i++) {
+        Segment segment   = transformation->segment_vector.segments[i];
+        Point   tail      = inner_point(t_tail, segment.start, segment.end);
+        Point   head      = inner_point(t, segment.start, segment.end);
+        uint8_t intensity = segment.start_intensity == segment.end_intensity
+                              ? segment.end_intensity
+                              : segment.start_intensity + ((segment.end_intensity - segment.start_intensity) * t);
+        collect_glow(transformation, transformation->glow_next, tail, intensity / 2);
+        collect_glow(transformation, transformation->glow_next, head, intensity / 2);
     }
 
     for (int i = 0; i < transformation->static_points_count; i++) {
@@ -822,6 +730,7 @@ void app_main(void)
         idx                 = idx_backup;
         if (!create_cell_morphing(render, font, screen, codepointFrom, codepointTo)) {
             ESP_LOGE(TAG, "Unable to create morph U+%04" PRIX32 " -> U+%04" PRIX32, codepointFrom, codepointTo);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
             continue;
         }
         if (!initial_glow_collected) {

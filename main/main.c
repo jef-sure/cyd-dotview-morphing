@@ -142,7 +142,7 @@ static bool hash_init(MorphingRender *hash, int hash_capacity)
         return false;
     }
     hash_capacity = hash_next_pow2(hash_capacity);
-    hash->slots = (SegmentHashSlot *)calloc((size_t)hash_capacity, sizeof(SegmentHashSlot));
+    hash->slots   = (SegmentHashSlot *)calloc((size_t)hash_capacity, sizeof(SegmentHashSlot));
     if (hash->slots == NULL) {
         return false;
     }
@@ -447,10 +447,8 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
         return false;
     }
     if (render->vscreen == NULL || render->grid_width != width * cell_width || render->grid_height != height * cell_width) {
-        ESP_LOGE(
-            TAG, "create_cell_morphing: grid mismatch grid=%dx%d expected=%dx%d (w=%d h=%d cw=%d)", render->grid_width, render->grid_height,
-            width * cell_width, height * cell_width, width, height, cell_width
-        );
+        ESP_LOGE(TAG, "create_cell_morphing: grid mismatch grid=%dx%d expected=%dx%d (w=%d h=%d cw=%d)", render->grid_width, render->grid_height,
+                 width * cell_width, height * cell_width, width, height, cell_width);
         free(from);
         free(to);
         return false;
@@ -508,8 +506,7 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
         free(to);
         return false;
     }
-    size_t max_point_count = (size_t)width * height;
-    Point *static_points   = (Point *)calloc(max_point_count, sizeof(Point));
+    Point *static_points = (Point *)calloc(to->number_of_set_cells, sizeof(Point));
     if (static_points == NULL) {
         ESP_LOGE(TAG, "create_cell_morphing: calloc static_points failed");
         free(from);
@@ -517,7 +514,7 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
         free(source_used);
         return false;
     }
-    Point *fading_points = (Point *)calloc(max_point_count, sizeof(Point));
+    Point *fading_points = (Point *)calloc(from->number_of_set_cells, sizeof(Point));
     if (fading_points == NULL) {
         ESP_LOGE(TAG, "create_cell_morphing: calloc fading_points failed");
         free(from);
@@ -526,11 +523,21 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
         free(static_points);
         return false;
     }
-
-    int fading_points_count = 0;
-    int static_points_count = 0;
-    render->static_points   = static_points;
-    render->fading_points   = fading_points;
+    uint8_t *dest_second_phase = (uint8_t *)calloc((size_t)(width * height + 7) / 8, sizeof(uint8_t));
+    if (dest_second_phase == NULL) {
+        ESP_LOGE(TAG, "create_cell_morphing: calloc dest_second_phase failed");
+        free(from);
+        free(to);
+        free(source_used);
+        free(static_points);
+        free(fading_points);
+        return false;
+    }
+    int fading_points_count       = 0;
+    int static_points_count       = 0;
+    render->static_points         = static_points;
+    render->fading_points         = fading_points;
+    bool is_second_phase_required = false;
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             bool    from_cell = is_cell_set(from->cells, x, y, width);
@@ -560,46 +567,56 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
                     }
                 }
                 if (!found_source) {
-                    const int max_scale = max_int(from->width, from->height);
-                    for (int scale = 2; scale <= max_scale && !found_source; ++scale) {
-                        // d — смещение вдоль стороны квадрата от осевой точки к углу
-                        for (int d = 0; d <= scale && !found_source; ++d) {
-                            for (int k = 0; k < 4 && !found_source; ++k) {
-                                // при d == scale это углы; их целиком покрывают верхняя и нижняя стороны
-                                if (d == scale && neibx[k] != 0) continue;
-                                // вектор вдоль стороны, перпендикулярный оси: (-ay, ax)
-                                const int px = -neiby[k];
-                                const int py = neibx[k];
-                                for (int sgn = -1; sgn <= 1; sgn += 2) {
-                                    if (d == 0 && sgn == 1) continue; // при d == 0 обе точки совпадают
-                                    int nx = x + neibx[k] * scale + sgn * d * px;
-                                    int ny = y + neiby[k] * scale + sgn * d * py;
-                                    if (nx >= 0 && nx < from->width && ny >= 0 && ny < from->height &&
-                                        is_cell_set(from->cells, nx, ny, from->width) && !is_cell_set(source_used, nx, ny, from->width)) {
-                                        Segment s = (Segment){
-                                            .end             = {.x = x * cell_width + (cell_width / 2),  .y = y * cell_width + (cell_width / 2) },
-                                            .start           = {.x = nx * cell_width + (cell_width / 2), .y = ny * cell_width + (cell_width / 2)},
-                                            .start_intensity = 255,
-                                            .end_intensity   = 255
-                                        };
-                                        hash_add(render, x, y, s);
-                                        mark_cell_set(source_used, nx, ny, from->width, true);
-                                        found_source = true;
-                                        break;
-                                    }
+                    is_second_phase_required = true;
+                    mark_cell_set(dest_second_phase, x, y, width, true);
+                }
+            }
+        }
+    }
+    if (is_second_phase_required) {
+        const int max_scale = max_int(from->width, from->height);
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                if (!is_cell_set(dest_second_phase, x, y, width)) continue;
+                bool found_source = false;
+                for (int scale = 2; scale <= max_scale && !found_source; ++scale) {
+                    // d — смещение вдоль стороны квадрата от осевой точки к углу
+                    for (int d = 0; d <= scale && !found_source; ++d) {
+                        for (int k = 0; k < 4 && !found_source; ++k) {
+                            // при d == scale это углы; их целиком покрывают верхняя и нижняя стороны
+                            if (d == scale && neibx[k] != 0) continue;
+                            // вектор вдоль стороны, перпендикулярный оси: (-ay, ax)
+                            const int px = -neiby[k];
+                            const int py = neibx[k];
+                            for (int sgn = -1; sgn <= 1; sgn += 2) {
+                                if (d == 0 && sgn == 1) continue; // при d == 0 обе точки совпадают
+                                int nx = x + neibx[k] * scale + sgn * d * px;
+                                int ny = y + neiby[k] * scale + sgn * d * py;
+                                if (nx >= 0 && nx < from->width && ny >= 0 && ny < from->height && is_cell_set(from->cells, nx, ny, from->width) &&
+                                    !is_cell_set(source_used, nx, ny, from->width)) {
+                                    Segment s = (Segment){
+                                        .end             = {.x = x * cell_width + (cell_width / 2),  .y = y * cell_width + (cell_width / 2) },
+                                        .start           = {.x = nx * cell_width + (cell_width / 2), .y = ny * cell_width + (cell_width / 2)},
+                                        .start_intensity = 255,
+                                        .end_intensity   = 255
+                                    };
+                                    hash_add(render, x, y, s);
+                                    mark_cell_set(source_used, nx, ny, from->width, true);
+                                    found_source = true;
+                                    break;
                                 }
                             }
                         }
                     }
-                    if (!found_source) {
-                        Segment s = (Segment){
-                            .end             = {.x = x * cell_width + (cell_width / 2), .y = y * cell_width + (cell_width / 2)},
-                            .start           = center_point,
-                            .start_intensity = 0,
-                            .end_intensity   = 255
-                        };
-                        hash_add(render, x, y, s);
-                    }
+                }
+                if (!found_source) {
+                    Segment s = (Segment){
+                        .end             = {.x = x * cell_width + (cell_width / 2), .y = y * cell_width + (cell_width / 2)},
+                        .start           = center_point,
+                        .start_intensity = 0,
+                        .end_intensity   = 255
+                    };
+                    hash_add(render, x, y, s);
                 }
             }
         }
@@ -614,6 +631,7 @@ static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_s
         }
     }
     render->fading_points_count = fading_points_count;
+    free(dest_second_phase);
     free(source_used);
     free(from);
     free(to);
@@ -721,15 +739,14 @@ void render_morphing(float t, MorphingRender *transformation)
             continue;
         }
         for (int j = 0; j < slot->cell.hash_count; j++) {
-            Segment *segment = &slot->cell.segments[j];
-            Point    tail    = inner_point(t_tail, segment->start, segment->end);
-            Point    head    = inner_point(t, segment->start, segment->end);
-            uint8_t  tail_intensity =
-                segment->start_intensity == segment->end_intensity ? segment->start_intensity : (uint8_t)(segment->start_intensity * (1.0f - t));
-            uint8_t head_intensity =
-                segment->start_intensity == segment->end_intensity ? segment->end_intensity : (uint8_t)(segment->end_intensity * t);
-            collect_glow(transformation, transformation->glow_next, tail, tail_intensity / 2);
-            collect_glow(transformation, transformation->glow_next, head, head_intensity / 2);
+            Segment *segment   = &slot->cell.segments[j];
+            Point    tail      = inner_point(t_tail, segment->start, segment->end);
+            Point    head      = inner_point(t, segment->start, segment->end);
+            uint8_t  intensity = segment->start_intensity == segment->end_intensity
+                                   ? segment->end_intensity
+                                   : segment->start_intensity + ((segment->end_intensity - segment->start_intensity) * t);
+            collect_glow(transformation, transformation->glow_next, tail, intensity / 2);
+            collect_glow(transformation, transformation->glow_next, head, intensity / 2);
         }
     }
 
@@ -785,47 +802,56 @@ void app_main(void)
     if (render == NULL) {
         return;
     }
-    render->font_y_bottom_max             = font_y_bottom_max;
-    render->font_x_lowest                 = font_x_lowest;
-    bool           initial_glow_collected = false;
-    static uint8_t cPoints[]              = "0123456789 ABCD EF GHIJKL MN OPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    render->font_y_bottom_max   = font_y_bottom_max;
+    render->font_x_lowest       = font_x_lowest;
+    bool initial_glow_collected = false;
+    //
+    static const char *cPoints = "0123456789 AÄBCDEFGHIJKLMNOÖPQRSTUÜVWXYZaäbcdefghijklmnoöpqrsßtuüvwxyz "
+                                 "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя";
+    //
+    size_t idx = 0;
     while (true) {
-        for (int ci = 0; ci < sizeof(cPoints) - 1; ci++) {
-            uint32_t from = cPoints[ci];
-            uint32_t to   = cPoints[(ci + 1) % (sizeof(cPoints) - 1)];
-            if (!create_cell_morphing(render, font, screen, from, to)) {
-                ESP_LOGE(TAG, "Unable to create morph %c -> %c", (char)from, (char)to);
-                continue;
-            }
-            if (!initial_glow_collected) {
-                collect_initial_glow(render);
-                initial_glow_collected = true;
-            }
-
-            int64_t  fps_started = esp_timer_get_time();
-            uint32_t frame_count = 0;
-            int64_t  start_time  = esp_timer_get_time();
-            while (true) {
-                float t = (float)(esp_timer_get_time() - start_time) / 1000000.0f;
-                if (t > 1.0f) {
-                    t = 1.0f;
-                }
-                render_morphing(t, render);
-                dgx_vscreen_to_screen(screen, (screen->width - render->grid_width) / 2, (screen->height - render->grid_height) / 2, render->vscreen);
-                frame_count++;
-                int64_t fps_elapsed = esp_timer_get_time() - fps_started;
-                if (fps_elapsed >= 1000000) {
-                    ESP_LOGI(TAG, "FPS: %.1f", frame_count * 1000000.0 / fps_elapsed);
-                    fps_started = esp_timer_get_time();
-                    frame_count = 0;
-                }
-                if (t >= 1.0f) {
-                    break;
-                }
-                vTaskDelay(1);
-            }
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        uint32_t codepointFrom;
+        codepointFrom = decodeUTF8next(cPoints, &idx);
+        if (cPoints[idx] == '\0') {
+            idx = 0;
         }
+        uint32_t codepointTo;
+        size_t   idx_backup = idx;
+        codepointTo         = decodeUTF8next(cPoints, &idx);
+        idx                 = idx_backup;
+        if (!create_cell_morphing(render, font, screen, codepointFrom, codepointTo)) {
+            ESP_LOGE(TAG, "Unable to create morph U+%04" PRIX32 " -> U+%04" PRIX32, codepointFrom, codepointTo);
+            continue;
+        }
+        if (!initial_glow_collected) {
+            collect_initial_glow(render);
+            initial_glow_collected = true;
+        }
+
+        int64_t  fps_started = esp_timer_get_time();
+        uint32_t frame_count = 0;
+        int64_t  start_time  = esp_timer_get_time();
+        while (true) {
+            float t = (float)(esp_timer_get_time() - start_time) / 1000000.0f;
+            if (t > 1.0f) {
+                t = 1.0f;
+            }
+            render_morphing(t, render);
+            dgx_vscreen_to_screen(screen, (screen->width - render->grid_width) / 2, (screen->height - render->grid_height) / 2, render->vscreen);
+            frame_count++;
+            int64_t fps_elapsed = esp_timer_get_time() - fps_started;
+            if (fps_elapsed >= 1000000) {
+                ESP_LOGI(TAG, "FPS: %.1f", frame_count * 1000000.0 / fps_elapsed);
+                fps_started = esp_timer_get_time();
+                frame_count = 0;
+            }
+            if (t >= 1.0f) {
+                break;
+            }
+            vTaskDelay(1);
+        }
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
     morphing_render_free(render);
     free(render);

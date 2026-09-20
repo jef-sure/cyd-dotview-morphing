@@ -1,8 +1,23 @@
-# CYD + DGX boilerplate
+# cyd-dotview-morphing
 
-This project is a minimal ESP-IDF starter for a Cheap Yellow Display (CYD) using the DGX graphics component.
+ESP-IDF-приложение для платы "Cheap Yellow Display" (ESP32 + ILI9341), рисующее
+плавный glow-морфинг между символами шрифта: каждая буква/цифра растворяется в
+следующую точками свечения, а не резкой сменой кадра.
 
-## Quick start
+## Как это работает
+
+- Каждый символ раскладывается на сетку ячеек (`CellMatrix`) по битмапу глифа
+  выбранного шрифта `TerminusTTFMedium12`, но можно воспользоватьяс любым.
+- Между двумя символами строятся отрезки перехода (`Segment`): общие точки
+  остаются на месте, новые появляются из центра, исчезающие гаснут, а
+  "переехавшие" точки соединяются линией к ближайшему соседу в целевой фигуре.
+- На каждый кадр (`render_morphing`) отрезки и точки размываются в буфер
+  свечения (`glow_next`/`glow_prev`) с плавным smoothstep-переходом по времени
+  и рисуются во временный экран (`dgx_vscreen`), который затем целиком
+  выводится на физический дисплей по SPI.
+- Итоговое изображение центрируется на экране 320×240 (альбомная ориентация).
+
+## Быстрый старт
 
 ```sh
 idf.py set-target esp32
@@ -10,20 +25,26 @@ idf.py build
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
-## Included baseline
+## Структура проекта
 
-- ESP-IDF project skeleton
-- DGX dependency declaration via `main/idf_component.yml`
-- CYD/DGX configuration defaults in `sdkconfig.defaults`
-- C++/C formatting profile via `.clang-format`
-- VS Code and devcontainer settings for ESP-IDF development
+- `main/main.c` — вся логика: разбор глифов на ячейки, построение переходов,
+  рендер свечения и вывод на экран
+- `main/CMakeLists.txt` — регистрация компонента приложения и зависимость от `dgx`
+- `main/idf_component.yml` — версия компонента DGX
+- `sdkconfig.defaults` — конфигурация под ILI9341/DGX по умолчанию
+- `managed_components/jef-sure__dgx` — графическая библиотека DGX (шрифты, драйвер ILI9341, virtual screen)
 
-## Main project files
+## Пины дисплея (см. `main/main.c`)
 
-- `main/CMakeLists.txt` — registers the app component and DGX dependencies
-- `main/main.c` — application entry point
-- `sdkconfig.defaults` — default DSP/target configuration for DGX + ILI9341
+| Назначение | GPIO |
+|---|---|
+| MOSI | 13 |
+| MISO | 12 |
+| SCLK | 14 |
+| CS | 15 |
+| DC | 2 |
+| Backlight | 21 |
+| RST | не используется (`GPIO_NUM_NC`) |
 
-## Notes
+При использовании другой ревизии платы поправьте пины и параметры SPI в `cyd_init_display()`.
 
-Adapt the pins and display initialization for your exact CYD revision before moving on to rendering logic.

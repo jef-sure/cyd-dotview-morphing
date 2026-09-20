@@ -17,6 +17,7 @@
 #include "esp_timer.h"
 #include "fonts/ArialRegular12.h"
 #include "fonts/IBMCGALight8x16Light8x1616.h"
+#include "fonts/TerminusTTFMedium12.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -108,6 +109,8 @@ typedef struct
     int              fading_points_count;
     uint32_t         cp_from;
     uint32_t         cp_to;
+    int              font_y_bottom_max;
+    int              font_x_lowest;
 } MorphingRender;
 
 static uint32_t hash_xy(int x, int y)
@@ -139,11 +142,11 @@ static bool hash_init(MorphingRender *hash, int hash_capacity)
         return false;
     }
     hash_capacity = hash_next_pow2(hash_capacity);
-    memset(hash, 0, sizeof(*hash));
     hash->slots = (SegmentHashSlot *)calloc((size_t)hash_capacity, sizeof(SegmentHashSlot));
     if (hash->slots == NULL) {
         return false;
     }
+    hash->hash_count    = 0;
     hash->hash_capacity = hash_capacity;
     return true;
 }
@@ -298,36 +301,48 @@ void mark_cell_set(uint8_t *cells, int x, int y, int width, bool set)
     }
 }
 
-CellMatrix *create_cell_matrix(dgx_font_t *font, uint32_t codePoint)
+CellMatrix *create_cell_matrix(dgx_font_t *font, uint32_t codePoint, int font_y_bottom_max, int font_x_lowest)
 {
-    int         width  = font->xWidest;
-    int         height = font->yAdvance;
-    CellMatrix *matrix = (CellMatrix *)calloc(1, sizeof(CellMatrix) + (width * height * sizeof(uint8_t)));
-    if (matrix == NULL) {
+    if (font == NULL || font->xWidest <= 0 || font->yAdvance <= 0) {
         return NULL;
     }
+
     int16_t        xAdvance;
     const glyph_t *g = dgx_font_find_glyph(codePoint, font, &xAdvance);
     if (g == NULL) {
-        free(matrix);
         return NULL;
     }
+
+    int         width      = font->xWidest - (font_x_lowest < 0 ? font_x_lowest : 0);
+    int         height     = font_y_bottom_max - font->yOffsetLowest;
+    int         x_shift    = font_x_lowest < 0 ? -font_x_lowest : 0;
+    size_t      cell_bytes = ((size_t)width * (size_t)height + 7u) / 8u;
+    CellMatrix *matrix     = (CellMatrix *)calloc(1, sizeof(*matrix) + cell_bytes);
+    if (matrix == NULL) {
+        return NULL;
+    }
+
     if (font->f_type == DGX_FONT_DOTS) {
         for (int di = 0; di < g->number_of_dots; di++) {
-            int x = g->dots[di].x;
-            int y = g->dots[di].y;
-            mark_cell_set(matrix->cells, x, y, width, true);
+            int x = g->dots[di].x + g->xOffset + x_shift;
+            int y = g->dots[di].y + g->yOffset - font->yOffsetLowest;
+            if (x >= 0 && x < width && y >= 0 && y < height && !is_cell_set(matrix->cells, x, y, width)) {
+                mark_cell_set(matrix->cells, x, y, width, true);
+                matrix->number_of_set_cells++;
+            }
         }
     } else {
-        bool            is_stream = font->f_type == DGX_FONT_BITMAP_STREAM;
-        dgx_bw_bitmap_t bmap      = dgx_bw_bitmap_make_of((uint8_t *)g->bitmap, g->width, g->height, is_stream);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                bool px = false;
-                if (x < g->width && y < g->height) px = dgx_bw_bitmap_get_pixel(&bmap, x, y);
-                mark_cell_set(matrix->cells, x, y, width, px);
-                if (px) {
-                    matrix->number_of_set_cells++;
+        dgx_bw_bitmap_t bmap = dgx_bw_bitmap_make_of((uint8_t *)g->bitmap, g->width, g->height, font->f_type == DGX_FONT_BITMAP_STREAM);
+        for (int by = 0; by < g->height; ++by) {
+            for (int bx = 0; bx < g->width; bx++) {
+                bool pix = dgx_bw_bitmap_get_pixel(&bmap, bx, by);
+                if (pix) {
+                    int x = bx + g->xOffset + x_shift;
+                    int y = by + g->yOffset - font->yOffsetLowest;
+                    if (x >= 0 && x < width && y >= 0 && y < height && !is_cell_set(matrix->cells, x, y, width)) {
+                        mark_cell_set(matrix->cells, x, y, width, true);
+                        matrix->number_of_set_cells++;
+                    }
                 }
             }
         }
@@ -352,7 +367,20 @@ static void morphing_render_free(MorphingRender *render)
     free(render->static_points);
     free(render->fading_points);
     hash_free(render);
-    free(render);
+}
+
+static void morphing_render_clear_transition(MorphingRender *render)
+{
+    if (render == NULL) {
+        return;
+    }
+    hash_clear(render);
+    free(render->static_points);
+    free(render->fading_points);
+    render->static_points       = NULL;
+    render->fading_points       = NULL;
+    render->static_points_count = 0;
+    render->fading_points_count = 0;
 }
 
 static bool morphing_render_init(MorphingRender *render, int width, int height, int cell_width)
@@ -360,7 +388,11 @@ static bool morphing_render_init(MorphingRender *render, int width, int height, 
     if (render == NULL || width <= 0 || height <= 0 || cell_width <= 0) {
         return false;
     }
+    int font_y_bottom_max = render->font_y_bottom_max;
+    int font_x_lowest     = render->font_x_lowest;
     memset(render, 0, sizeof(*render));
+    render->font_y_bottom_max = font_y_bottom_max;
+    render->font_x_lowest     = font_x_lowest;
     if (!hash_init(render, 16)) {
         return false;
     }
@@ -392,34 +424,43 @@ static bool morphing_render_init(MorphingRender *render, int width, int height, 
     return true;
 }
 
-MorphingRender *create_cell_morphing(dgx_font_t *font, uint32_t cFrom, uint32_t cTo, int cell_width)
+static bool create_cell_morphing(MorphingRender *render, dgx_font_t *font, dgx_screen_t *screen, uint32_t cFrom, uint32_t cTo)
 {
-    CellMatrix *from = create_cell_matrix(font, cFrom);
-    CellMatrix *to   = create_cell_matrix(font, cTo);
+    if (render == NULL || font == NULL) {
+        return false;
+    }
+    CellMatrix *from = create_cell_matrix(font, cFrom, render->font_y_bottom_max, render->font_x_lowest);
+    CellMatrix *to   = create_cell_matrix(font, cTo, render->font_y_bottom_max, render->font_x_lowest);
     if (from == NULL && to == NULL) {
+        ESP_LOGE(TAG, "create_cell_morphing: no glyph found for '%c' or '%c'", (char)cFrom, (char)cTo);
         free(from);
         free(to);
-        return NULL;
+        return false;
     }
-    MorphingRender *render = (MorphingRender *)calloc(1, sizeof(*render));
-    if (render == NULL) {
+    int width      = from ? from->width : to->width;
+    int height     = from ? from->height : to->height;
+    int cell_width = min_int(screen->width / width, screen->height / height);
+    if (render->vscreen == NULL && !morphing_render_init(render, width, height, cell_width)) {
+        ESP_LOGE(TAG, "create_cell_morphing: morphing_render_init failed (w=%d h=%d cw=%d)", width, height, cell_width);
         free(from);
         free(to);
-        return NULL;
+        return false;
     }
-    int width = from? from->width : to->width;
-    int height = from? from->height: to->height;
-    if (!morphing_render_init(render, width, height, cell_width)) {
+    if (render->vscreen == NULL || render->grid_width != width * cell_width || render->grid_height != height * cell_width) {
+        ESP_LOGE(
+            TAG, "create_cell_morphing: grid mismatch grid=%dx%d expected=%dx%d (w=%d h=%d cw=%d)", render->grid_width, render->grid_height,
+            width * cell_width, height * cell_width, width, height, cell_width
+        );
         free(from);
         free(to);
-        free(render);
-        return NULL;
+        return false;
     }
+    morphing_render_clear_transition(render);
     if ((!from || from->number_of_set_cells == 0) && (!to || to->number_of_set_cells == 0)) {
+        ESP_LOGE(TAG, "create_cell_morphing: both glyphs '%c' and '%c' have no set cells", (char)cFrom, (char)cTo);
         free(from);
         free(to);
-        morphing_render_free(render);
-        return NULL;
+        return false;
     }
     Point center_point = {.x = (width / 2) * cell_width + (cell_width / 2), .y = (height / 2) * cell_width + (cell_width / 2)};
     if (!from || from->number_of_set_cells == 0) {
@@ -439,7 +480,7 @@ MorphingRender *create_cell_morphing(dgx_font_t *font, uint32_t cFrom, uint32_t 
         render->static_points_count = 0;
         free(from);
         free(to);
-        return render;
+        return true;
     }
     if (!to || to->number_of_set_cells == 0) {
         for (int y = 0; y < height; y++) {
@@ -458,31 +499,32 @@ MorphingRender *create_cell_morphing(dgx_font_t *font, uint32_t cFrom, uint32_t 
         render->static_points_count = 0;
         free(from);
         free(to);
-        return render;
+        return true;
     }
     uint8_t *source_used = (uint8_t *)calloc((size_t)(width * height + 7) / 8, sizeof(uint8_t));
     if (source_used == NULL) {
+        ESP_LOGE(TAG, "create_cell_morphing: calloc source_used failed");
         free(from);
         free(to);
-        morphing_render_free(render);
-        return NULL;
+        return false;
     }
-    Point *static_points = (Point *)calloc(to->number_of_set_cells, sizeof(Point));
+    size_t max_point_count = (size_t)width * height;
+    Point *static_points   = (Point *)calloc(max_point_count, sizeof(Point));
     if (static_points == NULL) {
+        ESP_LOGE(TAG, "create_cell_morphing: calloc static_points failed");
         free(from);
         free(to);
-        morphing_render_free(render);
         free(source_used);
-        return NULL;
+        return false;
     }
-    Point *fading_points = (Point *)calloc(from->number_of_set_cells, sizeof(Point));
+    Point *fading_points = (Point *)calloc(max_point_count, sizeof(Point));
     if (fading_points == NULL) {
+        ESP_LOGE(TAG, "create_cell_morphing: calloc fading_points failed");
         free(from);
         free(to);
-        morphing_render_free(render);
         free(source_used);
         free(static_points);
-        return NULL;
+        return false;
     }
 
     int fading_points_count = 0;
@@ -503,7 +545,8 @@ MorphingRender *create_cell_morphing(dgx_font_t *font, uint32_t cFrom, uint32_t 
                 for (int i = 0; i < 8; i++) {
                     int nx = x + neibx[i];
                     int ny = y + neiby[i];
-                    if (nx >= 0 && nx < width && ny >= 0 && ny < height && !is_cell_set(source_used, nx, ny, width)) {
+                    if (nx >= 0 && nx < width && ny >= 0 && ny < height && is_cell_set(from->cells, nx, ny, width) &&
+                        !is_cell_set(source_used, nx, ny, width)) {
                         Segment s = (Segment){
                             .end             = {.x = x * cell_width + (cell_width / 2),  .y = y * cell_width + (cell_width / 2) },
                             .start           = {.x = nx * cell_width + (cell_width / 2), .y = ny * cell_width + (cell_width / 2)},
@@ -532,7 +575,7 @@ MorphingRender *create_cell_morphing(dgx_font_t *font, uint32_t cFrom, uint32_t 
                                     int nx = x + neibx[k] * scale + sgn * d * px;
                                     int ny = y + neiby[k] * scale + sgn * d * py;
                                     if (nx >= 0 && nx < from->width && ny >= 0 && ny < from->height &&
-                                        !is_cell_set(source_used, nx, ny, from->width)) {
+                                        is_cell_set(from->cells, nx, ny, from->width) && !is_cell_set(source_used, nx, ny, from->width)) {
                                         Segment s = (Segment){
                                             .end             = {.x = x * cell_width + (cell_width / 2),  .y = y * cell_width + (cell_width / 2) },
                                             .start           = {.x = nx * cell_width + (cell_width / 2), .y = ny * cell_width + (cell_width / 2)},
@@ -561,27 +604,20 @@ MorphingRender *create_cell_morphing(dgx_font_t *font, uint32_t cFrom, uint32_t 
             }
         }
     }
-    if(static_points_count != to->number_of_set_cells) {
-        Point *shrunk_static        = (Point *)realloc(static_points, (size_t)static_points_count * sizeof(Point));
-        render->static_points       = shrunk_static != NULL || static_points_count == 0 ? shrunk_static : static_points;
-        render->static_points_count = static_points_count;
-    }
+    render->static_points_count = static_points_count;
     for (int y = 0; y < from->height; y++) {
         for (int x = 0; x < from->width; x++) {
-            if (!is_cell_set(source_used, x, y, from->width)) {
+            if (is_cell_set(from->cells, x, y, from->width) && !is_cell_set(to->cells, x, y, from->width) &&
+                !is_cell_set(source_used, x, y, from->width)) {
                 fading_points[fading_points_count++] = (Point){.x = x * cell_width + (cell_width / 2), .y = y * cell_width + (cell_width / 2)};
             }
         }
     }
-    if(fading_points_count != from->number_of_set_cells) {
-        Point *shrunk_fading        = (Point *)realloc(fading_points, (size_t)fading_points_count * sizeof(Point));
-        render->fading_points       = shrunk_fading != NULL || fading_points_count == 0 ? shrunk_fading : fading_points;
-        render->fading_points_count = fading_points_count;
-    }
+    render->fading_points_count = fading_points_count;
     free(source_used);
     free(from);
     free(to);
-    return render;
+    return true;
 }
 
 static dgx_screen_t *cyd_init_display(void)
@@ -657,27 +693,26 @@ static void collect_glow(MorphingRender *transformation, uint8_t *glow, Point po
 
 void collect_initial_glow(MorphingRender *transformation)
 {
-    for(int i = 0; i < transformation->static_points_count; i++) {
-        collect_glow(                                                                 //
-            transformation,                                                           //
-            transformation->glow_next,                                                //
-            transformation->static_points[i],                                         //
-            255                                                                       //
+    for (int i = 0; i < transformation->static_points_count; i++) {
+        collect_glow(                         //
+            transformation,                   //
+            transformation->glow_next,        //
+            transformation->static_points[i], //
+            255                               //
         );
     }
 }
 
-void draw_life_transformation(float t, MorphingRender *transformation)
+void render_morphing(float t, MorphingRender *transformation)
 {
     if (transformation == NULL || transformation->vscreen == NULL) {
         return;
     }
 
-    uint8_t *glow_accu = transformation->glow_prev;
+    uint8_t *glow_accu        = transformation->glow_prev;
     transformation->glow_prev = transformation->glow_next;
     transformation->glow_next = glow_accu;
-    memset(transformation->glow_next, 0,
-           (size_t)transformation->grid_width * transformation->grid_height);
+    memset(transformation->glow_next, 0, (size_t)transformation->grid_width * transformation->grid_height);
 
     float t_tail = max_float(t * 1.5f - 0.5f, 0.0f);
     for (int i = 0; i < transformation->hash_capacity; i++) {
@@ -687,16 +722,14 @@ void draw_life_transformation(float t, MorphingRender *transformation)
         }
         for (int j = 0; j < slot->cell.hash_count; j++) {
             Segment *segment = &slot->cell.segments[j];
-            Point tail = inner_point(t_tail, segment->start, segment->end);
-            Point head = inner_point(t, segment->start, segment->end);
-            uint8_t tail_intensity = segment->start_intensity == segment->end_intensity
-                                         ? segment->start_intensity
-                                         : (uint8_t)(segment->start_intensity * (1.0f - t));
-            uint8_t head_intensity = segment->start_intensity == segment->end_intensity
-                                         ? segment->end_intensity
-                                         : (uint8_t)(segment->end_intensity * t);
-            collect_glow(transformation, transformation->glow_next, tail, tail_intensity / 6);
-            collect_glow(transformation, transformation->glow_next, head, head_intensity / 6);
+            Point    tail    = inner_point(t_tail, segment->start, segment->end);
+            Point    head    = inner_point(t, segment->start, segment->end);
+            uint8_t  tail_intensity =
+                segment->start_intensity == segment->end_intensity ? segment->start_intensity : (uint8_t)(segment->start_intensity * (1.0f - t));
+            uint8_t head_intensity =
+                segment->start_intensity == segment->end_intensity ? segment->end_intensity : (uint8_t)(segment->end_intensity * t);
+            collect_glow(transformation, transformation->glow_next, tail, tail_intensity / 2);
+            collect_glow(transformation, transformation->glow_next, head, head_intensity / 2);
         }
     }
 
@@ -709,14 +742,13 @@ void draw_life_transformation(float t, MorphingRender *transformation)
         collect_glow(transformation, transformation->glow_next, transformation->fading_points[i], fade_intensity);
     }
 
-    uint32_t blend = (uint32_t)(256.0f * smoothstep3(t));
-    uint16_t *pixels = (uint16_t *)((dgx_vscreen_t *)transformation->vscreen)->v_array;
-    int pixel_count = transformation->grid_width * transformation->grid_height;
+    uint32_t  blend       = (uint32_t)(256.0f * smoothstep3(t));
+    uint16_t *pixels      = (uint16_t *)((dgx_vscreen_t *)transformation->vscreen)->v_array;
+    int       pixel_count = transformation->grid_width * transformation->grid_height;
     for (int i = 0; i < pixel_count; i++) {
-        uint8_t intensity = (uint8_t)((transformation->glow_next[i] * blend +
-                                       transformation->glow_prev[i] * (256 - blend)) >> 8);
-        uint16_t rgb = DGX_RGB_16(intensity, intensity, intensity);
-        pixels[i] = (uint16_t)((rgb >> 8) | (rgb << 8));
+        uint8_t  intensity           = (uint8_t)((transformation->glow_next[i] * blend + transformation->glow_prev[i] * (256 - blend)) >> 8);
+        uint16_t rgb                 = DGX_RGB_16(intensity, intensity, intensity);
+        pixels[i]                    = (uint16_t)((rgb >> 8) | (rgb << 8));
         transformation->glow_next[i] = intensity;
     }
 }
@@ -733,100 +765,68 @@ void app_main(void)
     if (screen == NULL) {
         return;
     }
-    gpio_config_t boot_btn_config = {
-        .pin_bit_mask = 1ULL << GPIO_NUM_0,
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-
-    gpio_config(&boot_btn_config);
-
-    LifeTransformation transformation;
-    LifeGeneration    *step = init_life(&transformation, life_types[0], screen);
-    if (step == NULL) {
+    int         font_y_bottom_max = INT32_MIN;
+    int         font_x_lowest     = INT32_MAX;
+    dgx_font_t *font              = TerminusTTFMedium12();
+    for (const glyph_array_t *r = font->glyph_ranges; r->number; ++r) {
+        for (int i = 0; i < r->number; i++) {
+            const glyph_t *g = r->glyphs + i;
+            if (g->yOffset + g->height > font_y_bottom_max) {
+                font_y_bottom_max = g->yOffset + g->height;
+            }
+            if (g->xOffset < font_x_lowest) {
+                font_x_lowest = g->xOffset;
+            }
+        }
+    }
+    ESP_LOGI(TAG, "Font Y Bottom Max: %d", font_y_bottom_max);
+    ESP_LOGI(TAG, "Font X Lowest: %d", font_x_lowest);
+    MorphingRender *render = (MorphingRender *)calloc(1, sizeof(*render));
+    if (render == NULL) {
         return;
     }
-
-    ESP_LOGI(TAG, "CYD display initialized: %dx%d, cell %dpx", screen->width, screen->height, transformation.cell_width);
-    collect_initial_glow(&transformation);
-    ButtonState button_state = gpio_get_level(GPIO_NUM_0) == 0 ? ButtonPressed : ButtonReleased;
-    int64_t     fps_start    = esp_timer_get_time();
-    uint32_t    frame_count  = 0;
-    uint32_t    step_count   = 0;
+    render->font_y_bottom_max             = font_y_bottom_max;
+    render->font_x_lowest                 = font_x_lowest;
+    bool           initial_glow_collected = false;
+    static uint8_t cPoints[]              = "0123456789 ABCD EF GHIJKL MN OPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     while (true) {
-        step_count++;
-        ESP_LOGI(TAG, "Step #%" PRIu32, step_count);
-        LifeGeneration *next = next_generation(step);
-        if (next != NULL && (!is_life_still_alive(next) || life_is_same(step, next))) {
-            const char *reason = !is_life_still_alive(next) ? "extinct" : "still life";
-            ESP_LOGI(TAG, "Restarting pattern (%s) after %" PRIu32 " steps", reason, step_count);
-            free(next); // extinct or still life: morph back to the seed
-            next       = transformation.life_creation_func();
-            step_count = 0;
-        }
-        if (next == NULL) {
-            ESP_LOGE(TAG, "next generation allocation failed");
-            break;
-        }
-        transformation.next        = next;
-        transformation.current     = step;
-        int64_t start_time         = esp_timer_get_time();
-        bool    restart_generation = false;
-        while (true) {
-            float t = (float)(esp_timer_get_time() - start_time) / 1000000.0f;
-            if (t > 1.0f) t = 1.0f;
-            dgx_fill_rectangle(transformation.vscreen, 0, 0, transformation.grid_width, transformation.grid_height, 0x000000);
-            draw_life_transformation(t, &transformation);
-            int offset_x = (screen->width - transformation.grid_width) / 2;
-            int offset_y = (screen->height - transformation.grid_height) / 2;
-            dgx_vscreen_to_screen(screen, offset_x, offset_y, transformation.vscreen);
-            frame_count++;
-            int64_t fps_elapsed = esp_timer_get_time() - fps_start;
-            if (fps_elapsed >= 1000000) {
-                ESP_LOGI(TAG, "FPS: %.1f", frame_count * 1000000.0f / fps_elapsed);
-                fps_start   = esp_timer_get_time();
-                frame_count = 0;
+        for (int ci = 0; ci < sizeof(cPoints) - 1; ci++) {
+            uint32_t from = cPoints[ci];
+            uint32_t to   = cPoints[(ci + 1) % (sizeof(cPoints) - 1)];
+            if (!create_cell_morphing(render, font, screen, from, to)) {
+                ESP_LOGE(TAG, "Unable to create morph %c -> %c", (char)from, (char)to);
+                continue;
             }
-            if (t >= 1.0f) break;
-            bool pressed = gpio_get_level(GPIO_NUM_0) == 0;
-            if (!pressed) {
-                button_state = ButtonReleased;
-            } else if (button_state == ButtonReleased) {
-                ESP_LOGI(TAG, "Restarting: pattern switch requested via button (after %" PRIu32 " steps)", step_count);
-                dgx_fill_rectangle(screen, offset_x, offset_y, transformation.vscreen->width, transformation.vscreen->height, 0x000000);
-                button_state                     = ButtonPressed;
-                life_creation_func_t create_func = life_types[0];
-                for (int i = 0; life_types[i] != NULL; i++) {
-                    if (life_types[i] == transformation.life_creation_func) {
-                        create_func = life_types[i + 1] == NULL ? life_types[0] : life_types[i + 1];
-                        break;
-                    }
-                }
-                free(next);
-                free(step);
-                next = NULL;
-                step = NULL;
-                life_transformation_free(&transformation);
-                step       = init_life(&transformation, create_func, screen);
-                step_count = 0;
-                if (step != NULL) {
-                    collect_initial_glow(&transformation);
-                }
-                restart_generation = true;
-                break;
+            if (!initial_glow_collected) {
+                collect_initial_glow(render);
+                initial_glow_collected = true;
             }
-        }
-        vTaskDelay(1); // feed the watchdog
-        if (restart_generation) {
-            if (step == NULL) break;
-            continue;
-        }
-        free(step);
-        step = next;
-    }
 
-    free(step);
-    life_transformation_free(&transformation);
+            int64_t  fps_started = esp_timer_get_time();
+            uint32_t frame_count = 0;
+            int64_t  start_time  = esp_timer_get_time();
+            while (true) {
+                float t = (float)(esp_timer_get_time() - start_time) / 1000000.0f;
+                if (t > 1.0f) {
+                    t = 1.0f;
+                }
+                render_morphing(t, render);
+                dgx_vscreen_to_screen(screen, (screen->width - render->grid_width) / 2, (screen->height - render->grid_height) / 2, render->vscreen);
+                frame_count++;
+                int64_t fps_elapsed = esp_timer_get_time() - fps_started;
+                if (fps_elapsed >= 1000000) {
+                    ESP_LOGI(TAG, "FPS: %.1f", frame_count * 1000000.0 / fps_elapsed);
+                    fps_started = esp_timer_get_time();
+                    frame_count = 0;
+                }
+                if (t >= 1.0f) {
+                    break;
+                }
+                vTaskDelay(1);
+            }
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+    }
+    morphing_render_free(render);
+    free(render);
 }
